@@ -19,13 +19,10 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   getAgentDir,
-  DEFAULT_MAX_BYTES,
-  DEFAULT_MAX_LINES,
   createBashTool,
   createEditTool,
   createReadTool,
   createWriteTool,
-  formatSize,
   truncateTail,
 } from "@earendil-works/pi-coding-agent";
 
@@ -37,6 +34,9 @@ import { jumpSocket, probeFingerprint } from "./src/ssh/connection.ts";
 interface RemoteState extends ParsedSsh {
   client: SshClient;
   cwd: string;
+  /** 懒初始化的 SFTP 会话，连接存活期间复用 */
+  sftpSession: SFTPWrapper | null;
+  sftpPending: Promise<SFTPWrapper> | null;
 }
 
 interface ForwardSpec {
@@ -66,9 +66,7 @@ const REMOTE_CONFIG_FILE = join(AGENT_DIR, "ssh-remote-config.json");
 const FALLBACK_REMOTE_CWD = "~";
 const DEFAULT_EXEC_MAX_LINES = 200;
 const DEFAULT_EXEC_MAX_BYTES = 16 * 1024;
-const DEFAULT_TURN_MAX_BYTES = 64 * 1024;
 const DEFAULT_TIMEOUT_SECONDS = 30;
-const SESSION_STATE_ENTRY_TYPE = "pi-ssh-remote-state";
 const CACHE_KEY = "__piHpcCredentialCacheV1";
 
 const cacheHost = globalThis as typeof globalThis & { [CACHE_KEY]?: SshCredentialCache };
@@ -109,23 +107,10 @@ function saveKnownHosts(hosts: Record<string, string>): void {
   } catch {}
 }
 
-function endpointConfig(config: RemoteConfig, command: string): RemoteEndpointConfig {
-  try {
-    const key = cacheId(parseSshCommand(command));
-    return config.endpoints?.[key] ?? {};
-  } catch {
-    return {};
-  }
-}
-
 function parseForwardSpec(value: string): ForwardSpec {
   const match = value.match(/^(\d+):([^:]+):(\d+)$/);
   if (!match) throw new Error(`Invalid port-forward: ${value}; expected LOCAL_PORT:REMOTE_HOST:REMOTE_PORT`);
   return { localPort: Number(match[1]), remoteHost: match[2]!, remotePort: Number(match[3]) };
-}
-
-function serializeForward(spec: ForwardSpec): string {
-  return `${spec.localPort}:${spec.remoteHost}:${spec.remotePort}`;
 }
 
 export default function sshRemoteExtension(pi: ExtensionAPI) {
@@ -136,7 +121,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   let defaultRemoteCwd = FALLBACK_REMOTE_CWD;
   let routeRemoteTools = false;
   let currentCtx: any = null;
-  let turnOutputBytes = 0;
+  let reconnecting: Promise<void> | null = null;
+  let cachedRemoteEditTool: ReturnType<typeof createEditTool> | null = null;
   const forwardServers = new Map<number, Server>();
   const forwardSpecs = new Map<number, ForwardSpec>();
 
@@ -186,16 +172,19 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       client = await connectHop(config, async () => undefined, ctx);
     }
 
-    // 获取真实的远程 CWD (无状态探测)
-    let resolvedCwd = targetCwd;
+    // 获取真实的远程 CWD 绝对路径 (无状态探测)
+    let resolvedCwd = "/";
     try {
-      const res = await execRemoteDirect(client!, `cd -- ${quote(targetCwd)} && pwd -P`, 5);
-      resolvedCwd = res.trim() || targetCwd;
+      const probeCmd = (!targetCwd || targetCwd === "~")
+        ? `cd && pwd -P`
+        : `cd -- ${quote(targetCwd)} && pwd -P`;
+      const res = await execRemoteDirect(client!, probeCmd, 5);
+      resolvedCwd = res.trim() || "/";
     } catch {
       resolvedCwd = "/";
     }
 
-    return { ...config, client: client!, cwd: resolvedCwd };
+    return { ...config, client: client!, cwd: resolvedCwd, sftpSession: null, sftpPending: null };
   };
 
   const withReconnect = async <T>(operation: (client: SshClient) => Promise<T>, signal?: AbortSignal): Promise<T> => {
@@ -205,10 +194,20 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return await operation(remote.client);
     } catch (error) {
       if (signal?.aborted || !isReconnectable(error)) throw error;
-      // 触发无缝重连
-      const reconnected = await establish(remote, remote.cwd, currentCtx);
-      remote.client.destroy();
-      remote = reconnected;
+      // 去重：并发断线只触发一次重连，后续调用等待同一个 Promise
+      if (!reconnecting) {
+        const staleRemote = remote;
+        reconnecting = establish(staleRemote, staleRemote.cwd, currentCtx)
+          .then((freshState) => {
+            if (staleRemote.sftpSession) {
+              try { staleRemote.sftpSession.end(); } catch {}
+            }
+            staleRemote.client.destroy();
+            remote = freshState;
+          })
+          .finally(() => { reconnecting = null; });
+      }
+      await reconnecting;
       return await operation(remote.client);
     }
   };
@@ -223,14 +222,14 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(new Error("aborted"));
 
-      // 注入默认非交互环境，杜绝交互死锁
-      const preppedCommand = `export DEBIAN_FRONTEND=noninteractive CI=true TERM=xterm-256color\n${command}\n`;
+      // 用 exec 包裹确保无 shell prompt 残留；env 在命令前注入
+      const preppedCommand = `export DEBIAN_FRONTEND=noninteractive CI=true TERM=dumb; exec /bin/sh -c ${quote(command)}`;
 
       let settled = false;
       let timer: NodeJS.Timeout | null = null;
 
-      // 开启 PTY 终端会话！所有子孙进程归属该终端控制，关闭时内核发 SIGHUP 自动清理
-      client.exec(preppedCommand, { pty: true }, (err, stream) => {
+      // 开启 PTY 终端会话！echo: false 抑制终端回显，rows/cols 设置合理尺寸避免自动换行
+      client.exec(preppedCommand, { pty: { echo: false, rows: 200, cols: 512, term: "dumb" } }, (err, stream) => {
         if (err) return reject(err);
 
         const chunks: Buffer[] = [];
@@ -263,8 +262,12 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           if (settled) return;
           settled = true;
           cleanup();
-          // 清洗控制字符（PTY 会回显 \r\n，标准化为 \n）
-          const raw = Buffer.concat(chunks).toString("utf8").replace(/\r\n/g, "\n");
+          // 清洗 PTY 控制字符：\r\n → \n、孤立 \r → \n、剥离 ANSI 转义序列与 OSC 序列
+          const raw = Buffer.concat(chunks)
+            .toString("utf8")
+            .replace(/\r\n?/g, "\n")
+            .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
+            .replace(/\x1b\][^\x07]*\x07/g, "");
           resolve(raw);
         });
 
@@ -308,9 +311,31 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
   };
 
+  /** 获取可复用的 SFTP 会话（懒初始化，断线后自动失效触发重连） */
+  const getSftp = (state: RemoteState): Promise<SFTPWrapper> => {
+    if (state.sftpSession) return Promise.resolve(state.sftpSession);
+    if (state.sftpPending) return state.sftpPending;
+    state.sftpPending = new Promise<SFTPWrapper>((resolve, reject) => {
+      state.client.sftp((err, sftp) => {
+        state.sftpPending = null;
+        if (err) return reject(err);
+        sftp.on("close", () => { state.sftpSession = null; });
+        state.sftpSession = sftp;
+        resolve(sftp);
+      });
+    });
+    return state.sftpPending;
+  };
+
   const resolvePath = (baseCwd: string, p: string): string => {
-    if (p.startsWith("/")) return p;
-    return posix.resolve(baseCwd, p);
+    if (!p || p === "." || p.trim() === "") return baseCwd;
+    if (p.startsWith("/")) return posix.normalize(p);
+    if (p === "~" || p.startsWith("~/")) {
+      const home = defaultRemoteCwd.startsWith("/") ? defaultRemoteCwd : "/";
+      return posix.normalize(p === "~" ? home : posix.join(home, p.slice(2)));
+    }
+    const base = baseCwd.startsWith("/") ? baseCwd : "/";
+    return posix.normalize(posix.join(base, p));
   };
 
   // --- 端口转发管理 ---
@@ -361,14 +386,15 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     execute: async (id, params, signal, update) => {
       if (!remote || !routeRemoteTools) return localRead.execute(id, params, signal, update);
 
-      const targetPath = resolvePath(defaultRemoteCwd, String(params.path || ""));
-      const content = await withReconnect((client) =>
-        withSftp(client, (sftp) =>
-          new Promise<Buffer>((resolve, reject) => {
-            sftp.readFile(targetPath, (err, data) => (err ? reject(err) : resolve(data)));
-          }),
-        ),
-      signal);
+      // 快照当前 CWD，防止并发 chdir 在 await 期间改变 defaultRemoteCwd
+      const snapshotCwd = defaultRemoteCwd;
+      const targetPath = resolvePath(snapshotCwd, String(params.path || ""));
+      const content = await withReconnect(async () => {
+        const sftp = await getSftp(remote!);
+        return new Promise<Buffer>((resolve, reject) => {
+          sftp.readFile(targetPath, (err, data) => (err ? reject(err) : resolve(data)));
+        });
+      }, signal);
 
       return {
         content: [{ type: "text", text: content.toString("utf8") }],
@@ -384,20 +410,24 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     execute: async (id, params, signal, update) => {
       if (!remote || !routeRemoteTools) return localWrite.execute(id, params, signal, update);
 
-      const targetPath = resolvePath(defaultRemoteCwd, String(params.path || ""));
+      // 快照当前 CWD，防止并发 chdir 在 await 期间改变 defaultRemoteCwd
+      const snapshotCwd = defaultRemoteCwd;
+      const targetPath = resolvePath(snapshotCwd, String(params.path || ""));
       const fileData = Buffer.from(String(params.content || ""), "utf8");
 
       await withReconnect(async (client) => {
         // 先确保远端目录存在
         await execRemoteDirect(client, `mkdir -p -- ${quote(posix.dirname(targetPath))}`);
-        await withSftp(client, (sftp) =>
-          new Promise<void>((resolve, reject) => {
-            sftp.writeFile(targetPath, fileData, (err) => (err ? reject(err) : resolve()));
-          }),
-        );
+        const sftp = await getSftp(remote!);
+        await new Promise<void>((resolve, reject) => {
+          sftp.writeFile(targetPath, fileData, (err) => (err ? reject(err) : resolve()));
+        });
       }, signal);
 
-      return { content: [{ type: "text", text: `Wrote ${fileData.length} bytes to ${targetPath}` }] };
+      return {
+        content: [{ type: "text", text: `Wrote ${fileData.length} bytes to ${targetPath}` }],
+        details: { path: targetPath, remote: true },
+      };
     },
   });
 
@@ -408,34 +438,35 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     execute: async (id, params, signal, update) => {
       if (!remote || !routeRemoteTools) return localEdit.execute(id, params, signal, update);
 
-      const remoteEditOps = {
-        readFile: (p: string) =>
-          withReconnect((client) =>
-            withSftp(client, (sftp) =>
-              new Promise<Buffer>((resolve, reject) => {
+      if (!cachedRemoteEditTool) {
+        const remoteEditOps = {
+          readFile: (p: string) =>
+            withReconnect(async () => {
+              const sftp = await getSftp(remote!);
+              return new Promise<Buffer>((resolve, reject) => {
                 sftp.readFile(resolvePath(defaultRemoteCwd, p), (err, data) => (err ? reject(err) : resolve(data)));
-              }),
-            ),
-          signal),
-        access: (p: string) =>
-          withReconnect((client) =>
-            withSftp(client, (sftp) =>
-              new Promise<void>((resolve, reject) => {
+              });
+            }, signal),
+          access: (p: string) =>
+            withReconnect(async () => {
+              const sftp = await getSftp(remote!);
+              return new Promise<void>((resolve, reject) => {
                 sftp.stat(resolvePath(defaultRemoteCwd, p), (err) => (err ? reject(err) : resolve()));
-              }),
-            ),
-          signal),
-        writeFile: (p: string, content: string) =>
-          withReconnect((client) =>
-            withSftp(client, (sftp) =>
-              new Promise<void>((resolve, reject) => {
+              });
+            }, signal),
+          writeFile: (p: string, content: string) =>
+            withReconnect(async () => {
+              const sftp = await getSftp(remote!);
+              return new Promise<void>((resolve, reject) => {
                 sftp.writeFile(resolvePath(defaultRemoteCwd, p), content, (err) => (err ? reject(err) : resolve()));
-              }),
-            ),
-          signal),
-      };
+              });
+            }, signal),
+        };
 
-      return createEditTool(localCwd, { operations: remoteEditOps as any }).execute(id, params, signal, update);
+        cachedRemoteEditTool = createEditTool(localCwd, { operations: remoteEditOps as any });
+      }
+
+      return cachedRemoteEditTool.execute(id, params, signal, update);
     },
   });
 
@@ -459,9 +490,12 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       let output = await withReconnect((client) => execRemoteInPty(client, isolatedCmd, timeoutSec, signal), signal);
 
       // 上下文防爆截断 (保留尾部关键日志)
-      const limits = { maxLines: DEFAULT_EXEC_MAX_LINES, maxBytes: DEFAULT_EXEC_MAX_BYTES };
+      const config = loadRemoteConfig();
+      const limits = {
+        maxLines: config.execMaxLines ?? DEFAULT_EXEC_MAX_LINES,
+        maxBytes: config.execMaxBytes ?? DEFAULT_EXEC_MAX_BYTES,
+      };
       const truncated = truncateTail(output, limits);
-      turnOutputBytes += Buffer.byteLength(truncated.content, "utf8");
 
       return {
         content: [{ type: "text", text: truncated.content || "Command completed with no output." }],
@@ -489,21 +523,35 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const parsed = parseSshCommand(params.command);
         const targetCwd = params.cwd || FALLBACK_REMOTE_CWD;
         const state = await establish(parsed, targetCwd, currentCtx);
-        if (remote) remote.client.destroy();
+        if (remote) {
+          if (remote.sftpSession) { try { remote.sftpSession.end(); } catch {} }
+          remote.client.destroy();
+        }
         remote = state;
+        cachedRemoteEditTool = null;
         defaultRemoteCwd = state.cwd;
         routeRemoteTools = true;
         updateStatus(currentCtx);
-        return { content: [{ type: "text", text: `Connected to ${remote.label} in ${defaultRemoteCwd}` }] };
+        return {
+          content: [{ type: "text", text: `Connected to ${remote.label} in ${defaultRemoteCwd}` }],
+          details: { host: remote.label, cwd: defaultRemoteCwd },
+        };
       }
 
       if (action === "disconnect") {
-        if (remote) remote.client.destroy();
+        if (remote) {
+          if (remote.sftpSession) { try { remote.sftpSession.end(); } catch {} }
+          remote.client.destroy();
+        }
         remote = null;
         routeRemoteTools = false;
+        cachedRemoteEditTool = null;
         await stopForwards();
         updateStatus(currentCtx);
-        return { content: [{ type: "text", text: "SSH remote disconnected. Tools reverted to local." }] };
+        return {
+          content: [{ type: "text", text: "SSH remote disconnected. Tools reverted to local." }],
+          details: {},
+        };
       }
 
       if (action === "chdir") {
@@ -515,14 +563,20 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         defaultRemoteCwd = resolved.trim();
         remote.cwd = defaultRemoteCwd;
         updateStatus(currentCtx);
-        return { content: [{ type: "text", text: `Remote working directory updated to ${defaultRemoteCwd}` }] };
+        return {
+          content: [{ type: "text", text: `Remote working directory updated to ${defaultRemoteCwd}` }],
+          details: { cwd: defaultRemoteCwd },
+        };
       }
 
       if (action === "forward") {
         if (!params.forwards) throw new Error("forwards spec required, e.g. 8080:127.0.0.1:8080");
         const spec = parseForwardSpec(params.forwards);
         await startForward(spec);
-        return { content: [{ type: "text", text: `Forwarding local port ${spec.localPort} -> ${spec.remoteHost}:${spec.remotePort}` }] };
+        return {
+          content: [{ type: "text", text: `Forwarding local port ${spec.localPort} -> ${spec.remoteHost}:${spec.remotePort}` }],
+          details: { forward: spec },
+        };
       }
 
       if (action === "unforward") {
@@ -533,7 +587,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           forwardServers.delete(port);
           forwardSpecs.delete(port);
         }
-        return { content: [{ type: "text", text: `Stopped forwarding port ${port}` }] };
+        return {
+          content: [{ type: "text", text: `Stopped forwarding port ${port}` }],
+          details: { port },
+        };
       }
 
       // action === "status"
@@ -544,24 +601,30 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             text: `SSH Remote: ${remote ? "Connected" : "Disconnected"}\nHost: ${remote?.label ?? "none"}\nCWD: ${defaultRemoteCwd}\nRouting: ${routeRemoteTools ? "Remote" : "Local"}`,
           },
         ],
+        details: {
+          connected: !!remote,
+          host: remote?.label ?? null,
+          cwd: defaultRemoteCwd,
+          routing: routeRemoteTools,
+        },
       };
     },
   });
 
   // --- Pi 生命周期事件与上下文注入 ---
-  pi.on("turn_start", () => {
-    turnOutputBytes = 0;
-  });
-
   pi.on("session_start", async (event, ctx) => {
     currentCtx = ctx;
     updateStatus(ctx);
   });
 
   pi.on("session_shutdown", async () => {
-    if (remote) remote.client.destroy();
+    if (remote) {
+      if (remote.sftpSession) { try { remote.sftpSession.end(); } catch {} }
+      remote.client.destroy();
+    }
     remote = null;
     routeRemoteTools = false;
+    cachedRemoteEditTool = null;
     await stopForwards();
   });
 
@@ -584,9 +647,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     handler: async (args: string, ctx: any) => {
       const parts = shellWords(args || "");
       if (parts[0] === "disconnect") {
-        if (remote) remote.client.destroy();
+        if (remote) {
+          if (remote.sftpSession) { try { remote.sftpSession.end(); } catch {} }
+          remote.client.destroy();
+        }
         remote = null;
         routeRemoteTools = false;
+        cachedRemoteEditTool = null;
         await stopForwards();
         updateStatus(ctx);
         ctx.ui.notify("SSH remote disconnected", "info");
@@ -596,8 +663,12 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const cmd = parts.join(" ");
         const parsed = parseSshCommand(cmd);
         const state = await establish(parsed, FALLBACK_REMOTE_CWD, ctx);
-        if (remote) remote.client.destroy();
+        if (remote) {
+          if (remote.sftpSession) { try { remote.sftpSession.end(); } catch {} }
+          remote.client.destroy();
+        }
         remote = state;
+        cachedRemoteEditTool = null;
         defaultRemoteCwd = state.cwd;
         routeRemoteTools = true;
         updateStatus(ctx);
