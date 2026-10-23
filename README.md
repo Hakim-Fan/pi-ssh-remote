@@ -6,7 +6,7 @@ pi-ssh-remote English documentation covering design for Pi Agent, core capabilit
 
 **Operate remote SSH servers with Pi as easily as local projects.**
 
-[中文文档](README.zh-CN.md) · [GitHub Repository](https://github.com/haki/pi-ssh-remote)
+[中文文档](README.zh-CN.md) · [GitHub Repository](https://github.com/Hakim-Fan/pi-ssh-remote)
 
 `pi-ssh-remote` is a dedicated SSH remote development extension for the Pi Coding Agent.
 
@@ -96,7 +96,7 @@ Port forwarding maps remote services to `localhost`, allowing local development 
 ## Installation
 
 ```bash
-pi install npm:@haki/pi-ssh-remote
+pi install npm:@hakifan/pi-ssh-remote
 ```
 
 - **Local Requirements**: Node.js 20+
